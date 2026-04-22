@@ -5,6 +5,9 @@ import is_ip_private from "private-ip";
 import dns from "node:dns";
 import { RequestPayload, YouTubeTranscriptPayload, downloadLimit, maxResponseBytes } from "./types.js";
 import { YouTubeTranscript } from "./YouTubeTranscript.js";
+import nodeFetch from "node-fetch";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import { SocksProxyAgent } from "socks-proxy-agent";
 
 export class Fetcher {
   private static applyLengthLimits(text: string, maxLength: number, startIndex: number): string {
@@ -52,6 +55,25 @@ export class Fetcher {
     }
   }
 
+  private static getProxyUrl(url: string, requestProxy?: string): string | undefined {
+    let proxyUrl = requestProxy;
+    if (!proxyUrl) {
+      const protocol = new URL(url).protocol;
+      const env = process.env;
+      if (protocol === 'https:') {
+        proxyUrl = env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy || env.ALL_PROXY || env.all_proxy;
+      } else if (protocol === 'http:') {
+        proxyUrl = env.HTTP_PROXY || env.http_proxy || env.ALL_PROXY || env.all_proxy;
+      }
+    }
+
+    if (proxyUrl && !proxyUrl.startsWith('http://') && !proxyUrl.startsWith('https://') && !proxyUrl.startsWith('socks')) {
+      proxyUrl = `http://${proxyUrl}`;
+    }
+
+    return proxyUrl;
+  }
+
   private static async _fetch({
     url,
     headers,
@@ -59,18 +81,33 @@ export class Fetcher {
   }: RequestPayload): Promise<Response> {
     this.validateUrl(url);
     await this.validateResolvedIp(url);
+
+    const proxyUrl = this.getProxyUrl(url, proxy);
     let response: Response;
+
     try {
-      response = await fetch(url, {
+      const fetchOptions: any = {
         headers: {
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
           ...headers,
         },
-        // Note: proxy is a Bun-specific fetch option. On Node.js, this option is silently ignored.
-        // To use a proxy on Node.js, you would need an HTTP agent library like http-proxy-agent.
-        ...(proxy ? { proxy } : {}),
-      } as RequestInit);
+      };
+
+      if (typeof Bun !== 'undefined') {
+        if (proxyUrl) {
+          fetchOptions.proxy = proxyUrl;
+        }
+        response = await fetch(url, fetchOptions);
+      } else {
+        if (proxyUrl) {
+          const agent = proxyUrl.startsWith("socks")
+            ? new SocksProxyAgent(proxyUrl)
+            : new HttpsProxyAgent(proxyUrl);
+          fetchOptions.agent = agent;
+        }
+        response = await nodeFetch(url, fetchOptions) as unknown as Response;
+      }
     } catch (e: unknown) {
       if (e instanceof Error) {
         throw new Error(`Failed to fetch ${url}: ${e.message}`);
@@ -97,24 +134,39 @@ export class Fetcher {
 
   private static async readResponseText(response: Response): Promise<string> {
     if (!response.body) return response.text();
-    const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let result = "";
     let bytesRead = 0;
+
     try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        bytesRead += value.byteLength;
-        if (bytesRead > maxResponseBytes) {
-          throw new Error(`Response too large: exceeded ${maxResponseBytes} byte limit while reading`);
+      if (typeof (response.body as any).getReader === "function") {
+        const reader = (response.body as any).getReader();
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            bytesRead += value.byteLength;
+            if (bytesRead > maxResponseBytes) {
+              throw new Error(`Response too large: exceeded ${maxResponseBytes} byte limit while reading`);
+            }
+            result += decoder.decode(value, { stream: true });
+          }
+        } finally {
+          reader.cancel();
         }
-        result += decoder.decode(value, { stream: true });
+      } else {
+        for await (const chunk of response.body as any) {
+          bytesRead += chunk.length;
+          if (bytesRead > maxResponseBytes) {
+            throw new Error(`Response too large: exceeded ${maxResponseBytes} byte limit while reading`);
+          }
+          result += decoder.decode(chunk, { stream: true });
+        }
       }
       result += decoder.decode();
       return result;
-    } finally {
-      reader.cancel();
+    } catch (e) {
+      throw e;
     }
   }
 
